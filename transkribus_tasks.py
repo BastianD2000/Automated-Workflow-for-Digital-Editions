@@ -149,7 +149,38 @@ def upload_all_documents(session_id, collection_id, main_dir):
         print("Upload process completed.")
 
 
+def filter_new_documents(session_id, collection_id, doc_ids):
+    """
+    Prüft für eine Liste von Dokumenten, welche den Status "New" haben,
+    und gibt nur diese Dokument-IDs zurück.
 
+    :param session_id: Transkribus Session-ID
+    :param collection_id: ID der Collection
+    :param doc_ids: Liste von Dokumenten-IDs
+    :return: Liste von Dokumenten-IDs mit Status "New"
+    """
+    headers = {"Cookie": f"JSESSIONID={session_id}"}
+    new_doc_ids = []
+
+    for doc_id in doc_ids:
+        url = f"{BASE_URL}/collections/{collection_id}/{doc_id}/fulldoc"
+        response = requests.get(url, headers=headers)
+
+        if response.status_code != 200:
+            logger.warning(f"Dokument {doc_id} konnte nicht geladen werden: {response.status_code}")
+            continue
+
+        try:
+            data = response.json()
+            md = data.get("md", {})
+            if md.get("nrOfNew", 0) == 1:
+                new_doc_ids.append(doc_id)
+        except Exception as e:
+            logger.warning(f"Fehler beim Verarbeiten von Dokument {doc_id}: {e}")
+            continue
+
+    logger.info(f"[+] Gefundene 'New'-Dokumente: {new_doc_ids}")
+    return new_doc_ids
 
 
 def get_session_id():
@@ -391,4 +422,5 @@ def export_and_download(session_id, collection_id, document_id):
         print(f"Download completed: {file_path}")
     else:
         print(f"Error downloading: {response.status_code} - {response.text}")
+
 
