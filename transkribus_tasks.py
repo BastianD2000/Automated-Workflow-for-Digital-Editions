@@ -173,8 +173,9 @@ def filter_new_documents(session_id, collection_id, doc_ids):
         try:
             data = response.json()
             md = data.get("md", {})
-            if md.get("nrOfNew", 0) == 1:
+            if md.get("nrOfNew", 0) > 0:
                 new_doc_ids.append(doc_id)
+
         except Exception as e:
             logger.warning(f"Fehler beim Verarbeiten von Dokument {doc_id}: {e}")
             continue
@@ -422,5 +423,4 @@ def export_and_download(session_id, collection_id, document_id):
         print(f"Download completed: {file_path}")
     else:
         print(f"Error downloading: {response.status_code} - {response.text}")
-
 
