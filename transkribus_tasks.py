@@ -9,11 +9,12 @@ import xml.etree.ElementTree as ET
 import hashlib
 import urllib.parse
 from ftplib import FTP
+import zipfile
 
 BASE_URL = "https://transkribus.eu/TrpServer/rest"
 load_dotenv()
 
-# Logging einrichten
+# Logging 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -21,27 +22,28 @@ logger = logging.getLogger(__name__)
 def upload_to_transkribus_via_ftp(session_id, ftp_username, ftp_password, collection_id, local_dir):
     """
     Uploads files to Transkribus via FTP and triggers ingestion into a specified collection.
-    Erwartet eine gültige Session-ID (z. B. von get_session_id).
+    Expects a valid session ID (e.g., from get_session_id).
 
-    :param session_id: Aktive Transkribus Session-ID
-    :param ftp_username: Transkribus FTP-Benutzername
-    :param ftp_password: Transkribus FTP-Passwort
-    :param collection_id: ID der Ziel-Collection in Transkribus
-    :param local_dir: Vollständiger Pfad zum lokalen Upload-Ordner
-    :return: collection_id falls erfolgreich, sonst None
+    :param session_id: Active Transkribus session ID
+    :param ftp_username: Transkribus FTP username
+    :param ftp_password: Transkribus FTP password
+    :param collection_id: ID of the target collection in Transkribus
+    :param local_dir: Full path to the local upload directory
+    :return: List of uploaded document titles if successful, otherwise []
     """
+
     try:
         headers = {"Cookie": f"JSESSIONID={session_id}"}
         session = requests.Session()
         session.headers.update(headers)
 
-        # FTP-Verbindung aufbauen
+        # create ftp-connection
         ftp = FTP("transkribus.eu")
         ftp.login(user=ftp_username, passwd=ftp_password)
 
         if not os.path.exists(local_dir):
-            logger.error(f"[!] Lokales Verzeichnis nicht gefunden: {local_dir}")
-            return None
+            logger.error(f"[!] Local directory couldn't be found: {local_dir}")
+            return []
 
         shorthand = os.path.basename(local_dir)
         ftp_dir = f"/{shorthand}"
@@ -56,22 +58,23 @@ def upload_to_transkribus_via_ftp(session_id, ftp_username, ftp_password, collec
             if os.path.isfile(local_path) and filename not in ftp.nlst():
                 with open(local_path, "rb") as file:
                     ftp.storbinary(f"STOR {filename}", file)
-                logger.info(f"[+] Datei hochgeladen: {filename}")
+                logger.info(f"[+] File uploaded: {filename}")
             else:
-                logger.info(f"[-] Datei übersprungen (bereits vorhanden): {filename}")
+                logger.info(f"[-] File skipped (already exists): {filename}")
 
-        # Ingest über REST-API anstoßen
+        # start ingest by API
         encoded_name = urllib.parse.quote(shorthand)
         ingest_url = f"{BASE_URL}/collections/{collection_id}/ingest?fileName={encoded_name}"
         ingest_response = session.post(ingest_url)
         ingest_response.raise_for_status()
-        logger.info(f"[+] Ingest ausgelöst für '{shorthand}': {ingest_response.text}")
+        logger.info(f"[+] Ingest started for '{shorthand}': {ingest_response.text}")
 
-        return collection_id
+        return [shorthand]  # return title
 
     except Exception as e:
-        logger.error(f"[!] Fehler beim FTP-Upload: {e}")
-        return None
+        logger.error(f"[!] Error while FTP-Upload: {e}")
+        return []
+
 
 
 def upload_all_documents(session_id, collection_id, main_dir):
@@ -81,12 +84,14 @@ def upload_all_documents(session_id, collection_id, main_dir):
     :param session_id: Active Transkribus session.
     :param collection_id: ID of the collection to upload to.
     :param main_dir: Main directory containing subfolders with image files.
+    :return: List of uploaded document titles
     """
 
     def calculate_md5(file_path):
         with open(file_path, "rb") as f:
             return hashlib.md5(f.read()).hexdigest()
 
+    uploaded_titles = []  # collect titles
     for folder_name in sorted(os.listdir(main_dir)):
         folder_path = os.path.join(main_dir, folder_name)
         if not os.path.isdir(folder_path):
@@ -142,22 +147,58 @@ def upload_all_documents(session_id, collection_id, main_dir):
                 print(f"Page {img} successfully uploaded.")
 
             print(f"Upload of '{folder_name}' with {len(images)} pages completed successfully.")
+            uploaded_titles.append(folder_name)  # save title
 
         except Exception as e:
             print(f"Error uploading '{folder_name}': {str(e)}")
 
-        print("Upload process completed.")
+    print("Upload process completed.")
+    return uploaded_titles  # return list of titles
+
+
+
+def wait_for_documents_to_appear(session_id, collection_id, expected_titles, timeout=300, poll_interval=5):
+    """
+    Waits until all expected document titles are visible in the collection list.
+    Returns a list of tuples (title, docId).
+
+    """
+    start = time.time()
+    headers = {"Cookie": f"JSESSIONID={session_id}"}
+    url = f"{BASE_URL}/collections/{collection_id}/list"
+
+    expected = set(expected_titles)
+    found = set()
+
+    while time.time() - start < timeout:
+        r = requests.get(url, headers=headers)
+        r.raise_for_status()
+        docs = r.json()
+
+        seen = {
+            (d.get("title") or d.get("md", {}).get("title")): d.get("docId")
+            for d in docs
+        }
+        found = {t for t in expected if t in seen}
+
+        if found == expected:
+            return [(t, seen[t]) for t in expected_titles]
+
+        time.sleep(poll_interval)
+
+    raise TimeoutError(f"Documents did not appear in the collection in time: {expected - found}")
+
 
 
 def filter_new_documents(session_id, collection_id, doc_ids):
     """
-    Prüft für eine Liste von Dokumenten, welche den Status "New" haben,
-    und gibt nur diese Dokument-IDs zurück.
+    Checks a list of documents to determine which have the status "New"
+    and returns only those document IDs.
 
-    :param session_id: Transkribus Session-ID
-    :param collection_id: ID der Collection
-    :param doc_ids: Liste von Dokumenten-IDs
-    :return: Liste von Dokumenten-IDs mit Status "New"
+    :param session_id: Transkribus session ID
+    :param collection_id: ID of the collection
+    :param doc_ids: List of document IDs
+    :return: List of document IDs with status "New"
     """
     headers = {"Cookie": f"JSESSIONID={session_id}"}
     new_doc_ids = []
@@ -167,7 +208,7 @@ def filter_new_documents(session_id, collection_id, doc_ids):
         response = requests.get(url, headers=headers)
 
         if response.status_code != 200:
-            logger.warning(f"Dokument {doc_id} konnte nicht geladen werden: {response.status_code}")
+            logger.warning(f"Document {doc_id} couldn't be loaded: {response.status_code}")
             continue
 
         try:
@@ -177,11 +218,12 @@ def filter_new_documents(session_id, collection_id, doc_ids):
                 new_doc_ids.append(doc_id)
 
         except Exception as e:
-            logger.warning(f"Fehler beim Verarbeiten von Dokument {doc_id}: {e}")
+            logger.warning(f"Error while processing the document {doc_id}: {e}")
             continue
 
-    logger.info(f"[+] Gefundene 'New'-Dokumente: {new_doc_ids}")
+    logger.info(f"[+] Found 'New'-documents: {new_doc_ids}")
     return new_doc_ids
+
 
 
 def get_session_id():
@@ -208,6 +250,8 @@ def get_session_id():
     except etree.ParseError:
         raise Exception("Error: The XML response could not be parsed.")
 
+
+
 def get_collections(session_id):
     """Fetches all collections as a list of tuples (ID, Name)."""
     headers = {"Cookie": f"JSESSIONID={session_id}"}
@@ -223,6 +267,8 @@ def get_collections(session_id):
     except ValueError as e:
         raise Exception(f"JSON-parsing-error: {e}")
 
+
+
 def get_documents_in_collection(session_id, collection_id):
     """Fetches all documents from a specific collection."""
     headers = {"Cookie": f"JSESSIONID={session_id}"}
@@ -237,6 +283,8 @@ def get_documents_in_collection(session_id, collection_id):
         return data
     except ValueError as e:
         raise Exception(f"JSON-parsing-error: {e}")
+
+
 
 def get_page_ids(session_id, collection_id, doc_id):
     """Fetch pageIds for a specific document via the /fulldoc endpoint."""
@@ -255,6 +303,8 @@ def get_page_ids(session_id, collection_id, doc_id):
         logger.error(f"Error when parsing the pages: {e}")
         return []
 
+
+
 def start_layout_analysis(session_id, collection_id, doc_id, page_ids):
     """Starts the layout analysis for the specified document, without requiring tsIds."""
 
@@ -272,7 +322,6 @@ def start_layout_analysis(session_id, collection_id, doc_id, page_ids):
                 page_id_el = etree.SubElement(pages_el, "pageId")
                 page_id_el.text = str(page_id)
 
-                # tsId weglassen
                 region_ids_el = etree.SubElement(pages_el, "regionIds")
                 region_ids_el.text = ""
 
@@ -310,6 +359,7 @@ def start_layout_analysis(session_id, collection_id, doc_id, page_ids):
         logger.error(f"[!] Unexpected error: {e}")
 
 
+
 def wait_for_jobs(session_id, doc_id=None, job_types=("LAJob", "TextRecognitionJob", "UploadJob"), poll_interval=5):
     """
     Waits until all relevant jobs are completed. If doc_id is None, it waits for all active jobs.
@@ -317,17 +367,17 @@ def wait_for_jobs(session_id, doc_id=None, job_types=("LAJob", "TextRecognitionJ
     headers = {"Cookie": f"JSESSIONID={session_id}"}
     job_list_url = f"{BASE_URL}/jobs/list"
 
-    print("Warte auf Transkribus-Jobs...")
+    print("Wait for Transkribus-Jobs...")
 
     while True:
         response = requests.get(job_list_url, headers=headers)
         if response.status_code != 200:
-            print(f"Fehler beim Jobstatus-Abruf: {response.status_code} - {response.text}")
+            print(f"Error retrieving job status: {response.status_code} - {response.text}")
             return
 
         jobs = response.json()
 
-        # Filtere nur relevante Jobs
+        # Filter for relevant jobs
         relevant_jobs = [
             job for job in jobs
             if (doc_id is None or job.get("docId") == doc_id)
@@ -336,10 +386,10 @@ def wait_for_jobs(session_id, doc_id=None, job_types=("LAJob", "TextRecognitionJ
         ]
 
         if not relevant_jobs:
-            print("Alle relevanten Jobs abgeschlossen.")
+            print("All relevant jobs completed.")
             break
 
-        print(f"Offene Jobs: {[ (j['jobId'], j['jobType'], j['state']) for j in relevant_jobs ]}")
+        print(f"Open Jobs: {[ (j['jobId'], j['jobType'], j['state']) for j in relevant_jobs ]}")
         time.sleep(poll_interval)
 
 
@@ -370,8 +420,9 @@ def start_ocr(session_id, collection_id, doc_id, page_ids): # Doesn't work yet!
         logger.error(f"[-] Error starting OCR: {response.status_code} - {response.text}")
 
 
+
 def export_and_download(session_id, collection_id, document_id):
-    """Exports and downloads the document after processing."""
+    """Exports, downloads, and extracts the document after processing."""
     headers = {"Cookie": f"JSESSIONID={session_id}"}
     url = f"{BASE_URL}/collections/{collection_id}/{document_id}/export"
     response = requests.post(url, headers=headers, json={"format": "application/zip"})
@@ -394,8 +445,9 @@ def export_and_download(session_id, collection_id, document_id):
 
     print(f"Export job started! Job ID: {job_id}")
 
+    # Wait for export to complete
     while True:
-        time.sleep(5)  
+        time.sleep(5)
         status_url = f"{BASE_URL}/jobs/{job_id}"
         status_response = requests.get(status_url, headers=headers)
 
@@ -404,23 +456,31 @@ def export_and_download(session_id, collection_id, document_id):
             return
 
         status_data = status_response.json()
-
         if status_data.get("state") == "FINISHED":
             download_url = status_data.get("result")
             if download_url:
-                print("Export completed! Download URL is available.")
+                print("Export completed. Download URL is available.")
                 break
         else:
             print(f"Export status: {status_data.get('state')}. Waiting for completion...")
 
+    # Download the file
     response = requests.get(download_url, stream=True)
     if response.status_code == 200:
-        file_path = os.path.join("downloads", f"export_{job_id}.zip")
         os.makedirs("downloads", exist_ok=True)
-        with open(file_path, "wb") as f:
+        zip_path = os.path.join("downloads", f"export_{job_id}.zip")
+        with open(zip_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=1024):
                 f.write(chunk)
-        print(f"Download completed: {file_path}")
+        print(f"Download completed: {zip_path}")
+
+        # Extract ZIP
+        extract_dir = os.path.join("downloads", f"export_{job_id}")
+        os.makedirs(extract_dir, exist_ok=True)
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_dir)
+        print(f"ZIP extracted to: {extract_dir}")
+
     else:
         print(f"Error downloading: {response.status_code} - {response.text}")
 
