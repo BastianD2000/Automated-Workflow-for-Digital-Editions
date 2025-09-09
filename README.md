@@ -9,7 +9,11 @@ eXist servers are integrated for further processing and the final publication.
 GitLab issues can be used for automatic logging of workflow runs.
 
 'transkribus_tasks.py' contains the functions for interacting with the Transkribus API.
+
 'transkribus_main.py' orchestrates the functions in a prefect workflow.
+
 'git_tasks.py' provides the functions for logging by GitLab-Issue and for pushing data to repositories.
+
 'exist_tasks.py' contains functions for interacting with eXist servers.
+
 'helper_tasks.py' contains a function for error handling and one for XML validation.
